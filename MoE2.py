@@ -8,13 +8,17 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader
 from data.data_loader import SMILESDataset 
 from utils.utli import Scheduler, EarlyStopping
-from utils.loss_fn import FocalLoss, BalancedBCELoss, HuberLoss, LogCoshLoss
+from utils.loss_fn import FocalLoss
 from model.moe import MoE
-from wandblogger import WandbLogger                
+import wandb
+
 
 
 
 PROJECT_NAME = "ADMET_MoE_Topk1_Project"
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def train_and_evaluate(transformer_kinds,
                        benchmark_key,
@@ -27,8 +31,9 @@ def train_and_evaluate(transformer_kinds,
     
      
     run_name = f"MoE_{benchmark_key}_{task}"
-    """
-    config = {
+    
+   
+    wandb.init(project=PROJECT_NAME, name=run_name, config={
         "transformer_kinds": transformer_kinds,
         "benchmark": benchmark_key,
         "task": task,
@@ -36,9 +41,8 @@ def train_and_evaluate(transformer_kinds,
         "batch_size": batch_size,
         "learning_rate": learning_rate,
         "seeds": seeds
-    }
-    logger = WandbLogger(project=PROJECT_NAME, run_name=run_name, config=config)
-    """
+    })
+    
 
 
     group = admet_group(path="data/")
@@ -54,11 +58,6 @@ def train_and_evaluate(transformer_kinds,
         
         train_df, test_df = benchmark["train_val"], benchmark["test"]
         train_df, valid_df = group.get_train_valid_split(benchmark=benchmark_name, split_type="default", seed=seed)
-
-        if task == "regression" and log_scale:
-            train_df["Y"] = train_df["Y"].apply(lambda x: np.log(x + 1))
-            valid_df["Y"] = valid_df["Y"].apply(lambda x: np.log(x + 1))
-            test_df["Y"] = test_df["Y"].apply(lambda x: np.log(x + 1))
         
         train_dataset = SMILESDataset(train_df)
         valid_dataset = SMILESDataset(valid_df)
@@ -73,15 +72,12 @@ def train_and_evaluate(transformer_kinds,
         if task == "binary":
             model = MoE(transformer_kinds=transformer_kinds)
             criterion = FocalLoss(alpha=0.25, gamma=2, reduction='mean')
-        else:
-            model = MoE(transformer_kinds=transformer_kinds)
-            criterion = HuberLoss(reduction='mean')
         
         model.to(device)
         optimizer = optim.Adam(model.parameters(), lr=learning_rate)
         scheduler = Scheduler(optimizer, factor=0.5, patience=5)
         ckpt_path = f".ckpt/advanced_checkpoint_{benchmark_name}_{seed}.pt"
-        early_stopper = EarlyStopping(patience=16, delta=0.001, path=ckpt_path)
+        early_stopper = EarlyStopping(patience=10, delta=0.001, path=ckpt_path)
         
         for epoch in range(epochs):
             model.train()
@@ -110,8 +106,9 @@ def train_and_evaluate(transformer_kinds,
             train_loss_epoch = train_loss / train_total
             if task == "binary":
                 train_acc_epoch = train_correct / train_total
-            else:
-                train_acc_epoch = None
+            
+            wandb.log({"train_loss": train_loss_epoch, "train_acc": train_acc_epoch, "epoch": epoch})
+
 
             model.eval()
             val_loss = 0.0
@@ -147,41 +144,17 @@ def train_and_evaluate(transformer_kinds,
                 except ImportError:
                     val_auprc = 0.0
                 val_metric = val_auprc
-            else:
-                if log_scale:
-                    exp_labels = np.exp(np.array(all_labels)) - 1
-                    exp_preds = np.exp(np.array(all_preds)) - 1
-                    from sklearn.metrics import mean_absolute_error
-                    val_mae = mean_absolute_error(exp_labels, exp_preds)
-                else:
-                    from sklearn.metrics import mean_absolute_error
-                    val_mae = mean_absolute_error(all_labels, all_preds)
-                val_metric = val_mae
+
+            wandb.log({"val_loss": val_loss_epoch, "val_auprc": val_metric,"val_acc":val_acc_epoch, "epoch": epoch})
             
+
             if task == "binary":
                 print(f"[Epoch {epoch+1}/{epochs} | Seed {seed}] "
                       f"Train Loss: {train_loss_epoch:.4f}, Val Loss: {val_loss_epoch:.4f}, "
                       f"Train Acc: {train_acc_epoch:.4f}, Val Acc: {val_acc_epoch:.4f} "
                       f"Val AUPRC: {val_metric:.4f}")
-            else:
-                print(f"[Epoch {epoch+1}/{epochs} | Seed {seed}] "
-                      f"Train Loss: {train_loss_epoch:.4f}, Val Loss: {val_loss_epoch:.4f}, "
-                      f"Val MAE: {val_metric:.4f}")
-            
-            log_dict = {
-                "epoch": epoch + 1,
-                "seed": seed,
-                "train_loss": train_loss_epoch,
-                "val_loss": val_loss_epoch,
-            }
-            if task == "binary":
-                log_dict["train_acc"] = train_acc_epoch
-                log_dict["val_acc"] = val_acc_epoch
-                log_dict["val_auprc"] = val_metric
-            else:
-                log_dict["val_mae"] = val_metric
-            
-            
+              
+        
             scheduler.step(val_loss_epoch)
             early_stopper(val_loss_epoch, model)
             if early_stopper.early_stop:
@@ -200,11 +173,7 @@ def train_and_evaluate(transformer_kinds,
         predictions = {}
         if task == "binary":
             predictions[benchmark_name] = torch.tensor(test_preds)
-        else:
-            if log_scale:
-                predictions[benchmark_name] = torch.tensor(np.exp(test_preds) - 1)
-            else:
-                predictions[benchmark_name] = torch.tensor(test_preds)
+
         predictions_list.append(predictions)
  
     results = group.evaluate_many(predictions_list)
@@ -213,12 +182,9 @@ def train_and_evaluate(transformer_kinds,
     if final_score:
         score_mean, score_std = final_score
         if task == "binary":
-          #  logger.log({"test_auprc_mean": score_mean, "test_auprc_std": score_std})
+            wandb.log({"test_auprc_mean": score_mean, "test_auprc_std": score_std})
             print(f"[TEST] {benchmark_key} => AUPRC mean={score_mean:.4f}, std={score_std:.4f}")
-        else:
-           # logger.log({"test_mae_mean": score_mean, "test_mae_std": score_std})
-            print(f"[TEST] {benchmark_key} => MAE mean={score_mean:.4f}, std={score_std:.4f}")
-    #logger.finish()
+    wandb.finish()
 
 
 
@@ -231,7 +197,7 @@ if __name__ == "__main__":
     ]
 
     benchmark_config = {
-       # 'cyp2c9_veith': ('binary', False),
+        'cyp2c9_veith': ('binary', False),
         'cyp2d6_veith': ('binary', False),
         'cyp3a4_veith': ('binary', False),
         'herg': ('binary', False),
